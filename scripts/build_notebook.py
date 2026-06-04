@@ -1,16 +1,15 @@
 #!/usr/bin/env python
-"""Build notebooks/eda.ipynb programmatically (no manual JSON editing).
+"""Build notebooks/eda.ipynb programmatically.
 
 Run: python scripts/build_notebook.py
 """
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "notebooks" / "eda.ipynb"
+OUT  = ROOT / "notebooks" / "eda.ipynb"
 
 
 def md(text: str) -> dict:
@@ -25,130 +24,640 @@ def code(text: str) -> dict:
 
 
 CELLS = [
-    md("# Titanic EDA\n"
-       "\n"
-       "Exploratory data analysis for the survival-classification pipeline. The goal "
-       "is to understand the data, justify the preprocessing and feature-engineering "
-       "choices made in `src/preprocessing.py`, and surface caveats relevant to "
-       "modelling.\n"
-       "\n"
-       "> The modelling code only ever uses the Kaggle **train.csv** (it is the only "
-       "file with the `Survived` label). The Kaggle **test.csv** is unlabelled and is "
-       "*not* used for evaluation.\n"),
 
-    md("## 1. Setup"),
-    code("import sys\n"
-         "from pathlib import Path\n"
-         "\n"
-         "# Make the project importable when running from notebooks/.\n"
-         "sys.path.insert(0, str(Path.cwd().parent))\n"
-         "\n"
-         "import numpy as np\n"
-         "import pandas as pd\n"
-         "import matplotlib.pyplot as plt\n"
-         "import seaborn as sns\n"
-         "\n"
-         "from src import config\n"
-         "from src.data import load_labelled_data\n"
-         "from src.preprocessing import engineer_features\n"
-         "\n"
-         "sns.set_theme(style='whitegrid')\n"
-         "pd.set_option('display.max_columns', 50)"),
+    md(
+        "# Titanic Survival — Professional EDA\n"
+        "\n"
+        "This notebook performs a structured exploratory data analysis for the\n"
+        "Titanic classification assignment.\n"
+        "\n"
+        "**Main goals**\n"
+        "1. Validate data quality and schema consistency.\n"
+        "2. Understand the target distribution and survival patterns.\n"
+        "3. Analyse missing-value mechanisms and preprocessing implications.\n"
+        "4. Explore every feature used by the final PyTorch model.\n"
+        "5. Translate findings into concrete preprocessing and modelling decisions.\n"
+        "\n"
+        "---\n"
+        "\n"
+        "**Pipeline context**\n"
+        "\n"
+        "- The **final submitted model** is `TitanicEmbeddingMLP` (PyTorch tabular\n"
+        "  embedding MLP).  Classical baselines (LR, RF, GB) are trained for\n"
+        "  comparison only and are **never used for inference**.\n"
+        "- **Kaggle `test.csv` does not contain `Survived` labels** and is\n"
+        "  therefore **never used for evaluation**.  All reported metrics come\n"
+        "  from a **stratified held-out split of `data/raw/train.csv`**\n"
+        "  (70 % train / 15 % val / 15 % test).\n"
+        "- All learned preprocessing is **fitted on the training split only**.\n"
+        "- The **Streamlit app** (`ds_app.py`) uses the trained\n"
+        "  `TitanicEmbeddingMLP` for inference on user-supplied CSVs.\n"
+        "- `gender_submission.csv` is Kaggle's example submission file and must\n"
+        "  **not** be treated as ground truth.\n"
+    ),
 
-    md("## 2. Load the data\n"
-       "\n"
-       "`load_labelled_data` uses the real Kaggle `train.csv` if present in "
-       "`data/raw/`, otherwise it falls back to the bundled synthetic sample so this "
-       "notebook always runs. Pass `use_sample=True` to force the sample."),
-    code("df = load_labelled_data(use_sample=False, download=False)\n"
-         "print('Shape:', df.shape)\n"
-         "df.head()"),
+    md("## 1. Imports and configuration"),
+    code("%matplotlib inline"),
+    code(
+        "import sys\n"
+        "import warnings\n"
+        "from pathlib import Path\n"
+        "\n"
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "import matplotlib.pyplot as plt\n"
+        "import seaborn as sns\n"
+        "from scipy import stats\n"
+        "from sklearn.feature_selection import mutual_info_classif\n"
+        "\n"
+        "warnings.filterwarnings('ignore')\n"
+        "pd.set_option('display.max_columns', 100)\n"
+        "pd.set_option('display.float_format', lambda x: f'{x:,.3f}')\n"
+        "sns.set_theme(style='whitegrid', context='notebook')\n"
+        "RANDOM_STATE = 42\n"
+        "\n"
+        "# Add repo root so we can import from src/\n"
+        "_nb_dir    = Path().resolve()\n"
+        "_repo_root = _nb_dir.parent if _nb_dir.name == 'notebooks' else _nb_dir\n"
+        "if str(_repo_root) not in sys.path:\n"
+        "    sys.path.insert(0, str(_repo_root))\n"
+    ),
 
-    md("## 3. Schema, dtypes, and missingness"),
-    code("df.info()"),
-    code("# Missing-value counts and percentages.\n"
-         "missing = df.isna().sum().to_frame('missing')\n"
-         "missing['pct'] = (missing['missing'] / len(df) * 100).round(1)\n"
-         "missing.sort_values('missing', ascending=False)"),
-    md("**What to look for.** In the real Titanic data, `Age` (~20%), `Cabin` (~77%), "
-       "and `Embarked` (2 rows) are missing. This motivates median imputation for "
-       "`Age`, deriving a coarse `Deck` from `Cabin` (with an explicit `Unknown` "
-       "level) rather than dropping it, and most-frequent imputation for `Embarked`."),
+    md(
+        "## 2. Data loading\n"
+        "\n"
+        "Raw Kaggle files live in `data/raw/` (relative to the repository root).\n"
+        "\n"
+        "- `data/raw/train.csv` — 891 rows **with** `Survived`.  All modelling\n"
+        "  and evaluation uses this file via an internal stratified split.\n"
+        "- `data/raw/test.csv` — 418 rows **without** `Survived`.  Loaded here\n"
+        "  for schema/distribution checks only; **never used for evaluation**.\n"
+        "- `data/raw/gender_submission.csv` — Kaggle baseline submission;\n"
+        "  **not** ground truth.\n"
+        "\n"
+        "> **Missing data?**  `python train.py` downloads the real Kaggle data.\n"
+        "> `--use-sample` is intended only for smoke testing and must not be used\n"
+        "> for final EDA or reported results.\n"
+    ),
+    code(
+        "DATA_DIR  = _repo_root / 'data' / 'raw'\n"
+        "TRAIN_CSV = DATA_DIR / 'train.csv'\n"
+        "TEST_CSV  = DATA_DIR / 'test.csv'\n"
+        "GS_CSV    = DATA_DIR / 'gender_submission.csv'\n"
+        "\n"
+        "if not TRAIN_CSV.exists():\n"
+        "    raise FileNotFoundError(\n"
+        "        f'train.csv not found at {TRAIN_CSV}.\\n'\n"
+        "        'Run: python train.py  (downloads from Kaggle credentials required).\\n'\n"
+        "        'Note: --use-sample is only for smoke testing, not for final EDA.'\n"
+        "    )\n"
+        "\n"
+        "train_df = pd.read_csv(TRAIN_CSV)\n"
+        "test_df  = pd.read_csv(TEST_CSV) if TEST_CSV.exists() else None\n"
+        "gs_df    = pd.read_csv(GS_CSV)   if GS_CSV.exists()   else None\n"
+        "\n"
+        "print(f'data/raw/train.csv : {train_df.shape}')\n"
+        "if test_df is not None: print(f'data/raw/test.csv  : {test_df.shape}')\n"
+        "if gs_df   is not None: print(f'data/raw/gender_submission.csv : {gs_df.shape}')\n"
+    ),
 
-    md("## 4. Target balance"),
-    code("ax = df[config.TARGET].value_counts().sort_index().plot(kind='bar')\n"
-         "ax.set_xticklabels(config.CLASS_NAMES, rotation=0)\n"
-         "ax.set_title('Survival counts'); ax.set_ylabel('Passengers')\n"
-         "plt.show()\n"
-         "print('Survival rate: {:.1%}'.format(df[config.TARGET].mean()))"),
-    md("The classes are imbalanced (~38% survived in the real data). This is why we "
-       "report precision/recall/F1/ROC-AUC in addition to accuracy, and why the "
-       "train/val/test splits are **stratified** on the target."),
+    md(
+        "## 3. Schema, dtypes, and sanity checks\n"
+        "\n"
+        "### Data dictionary\n"
+        "\n"
+        "| Column | Meaning | Modelling note |\n"
+        "|---|---|---|\n"
+        "| `PassengerId` | Unique row ID | Output only; not a predictive feature |\n"
+        "| `Survived` | Target (1=survived) | Available only in `train.csv` |\n"
+        "| `Pclass` | Ticket class 1/2/3 | Categorical; strong socioeconomic proxy |\n"
+        "| `Name` | Full name | Used to extract `Title` |\n"
+        "| `Sex` | Passenger sex | Usually the strongest feature |\n"
+        "| `Age` | Age in years | ~20 % missing; imputed + `AgeMissing` indicator |\n"
+        "| `SibSp` | Siblings/spouses aboard | Combined into `FamilySize` |\n"
+        "| `Parch` | Parents/children aboard | Combined into `FamilySize` |\n"
+        "| `Ticket` | Ticket ID | **Not in the final production pipeline** |\n"
+        "| `Fare` | Passenger fare | Right-skewed; log-transformed to `LogFare` |\n"
+        "| `Cabin` | Cabin code | ~77 % missing; used as `HasCabin` / `Deck` |\n"
+        "| `Embarked` | Port C/Q/S | 2 rows missing in train; categorical |\n"
+    ),
+    code(
+        "display(train_df.head())\n"
+        "print('dtypes:'); print(train_df.dtypes)\n"
+    ),
+    code(
+        "def missing_summary(df, name):\n"
+        "    m = df.isna().sum()\n"
+        "    return (pd.DataFrame({'dataset': name, 'missing': m,\n"
+        "                          'pct': (100*m/len(df)).round(2)})\n"
+        "            .query('missing > 0').sort_values('pct', ascending=False))\n"
+        "\n"
+        "parts = [missing_summary(train_df, 'train')]\n"
+        "if test_df is not None:\n"
+        "    parts.append(missing_summary(test_df, 'test'))\n"
+        "display(pd.concat(parts))\n"
+    ),
+    code(
+        "checks = {\n"
+        "    'train_duplicate_rows': int(train_df.duplicated().sum()),\n"
+        "    'train_dup_PassengerId': int(train_df['PassengerId'].duplicated().sum()),\n"
+        "    'target_unique': sorted(train_df['Survived'].unique().tolist()),\n"
+        "}\n"
+        "if test_df is not None:\n"
+        "    checks['test_dup_rows'] = int(test_df.duplicated().sum())\n"
+        "    checks['id_overlap'] = len(\n"
+        "        set(train_df['PassengerId']) & set(test_df['PassengerId']))\n"
+        "checks\n"
+    ),
+    md("No duplicates, no PassengerId overlap, target is exactly {0, 1}."),
 
-    md("## 5. Numeric feature distributions"),
-    code("num_cols = ['Age', 'Fare', 'SibSp', 'Parch']\n"
-         "df[num_cols].describe()"),
-    code("fig, axes = plt.subplots(2, 2, figsize=(11, 7))\n"
-         "for ax, col in zip(axes.ravel(), num_cols):\n"
-         "    sns.histplot(df[col].dropna(), kde=True, ax=ax)\n"
-         "    ax.set_title(col)\n"
-         "plt.tight_layout(); plt.show()"),
-    md("`Fare` is strongly right-skewed and `Age` is roughly bell-shaped. We "
-       "`StandardScaler` numeric features so the MLP trains stably; tree models would "
-       "not need this, but a neural net benefits from standardised inputs."),
+    md("## 4. Target distribution"),
+    code(
+        "counts = train_df['Survived'].value_counts().sort_index()\n"
+        "labels = ['Did not survive', 'Survived']\n"
+        "pct    = 100 * counts / counts.sum()\n"
+        "display(pd.DataFrame({'count': counts.values, 'pct': pct.values.round(2)},\n"
+        "                     index=labels))\n"
+        "fig, ax = plt.subplots(figsize=(5, 3.5))\n"
+        "ax.bar(labels, counts.values, color=sns.color_palette('deep')[:2])\n"
+        "for i, (c, p) in enumerate(zip(counts.values, pct.values)):\n"
+        "    ax.text(i, c+5, f'{c} ({p:.1f}%)', ha='center', fontsize=10)\n"
+        "ax.set_ylabel('Passengers'); ax.set_title('Survival count')\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "The target is **imbalanced** (~38 % survived).  This justifies reporting\n"
+        "Precision / Recall / F1 / ROC-AUC and using **stratified splits**.\n"
+    ),
 
-    md("## 6. Survival by categorical features"),
-    code("cat_cols = ['Sex', 'Pclass', 'Embarked']\n"
-         "fig, axes = plt.subplots(1, 3, figsize=(13, 4))\n"
-         "for ax, col in zip(axes, cat_cols):\n"
-         "    sns.barplot(data=df, x=col, y=config.TARGET, ax=ax, errorbar=None)\n"
-         "    ax.set_title(f'Survival rate by {col}'); ax.set_ylabel('P(survived)')\n"
-         "plt.tight_layout(); plt.show()"),
-    md("**Key signal.** Sex is the single most predictive feature (women survived far "
-       "more often), followed by passenger class. This is consistent with "
-       "\"women and children first\" and is exactly the structure the model should "
-       "capture."),
+    md("## 5. Missing-value analysis by target"),
+    code(
+        "for col in [c for c in train_df.columns if train_df[c].isna().any()]:\n"
+        "    r = train_df.groupby('Survived')[col].apply(\n"
+        "            lambda s: s.isna().mean() * 100).round(2)\n"
+        "    r.index = r.index.map({0: 'Did not survive', 1: 'Survived'})\n"
+        "    print(f'--- {col} (missing %) ---')\n"
+        "    print(r.to_string()); print()\n"
+    ),
+    md(
+        "**Age missingness appears informative** and is associated with survival\n"
+        "and passenger characteristics.  A binary `AgeMissing` indicator is\n"
+        "included in the production pipeline to capture this signal without\n"
+        "leakage.  Missing values are filled by `SimpleImputer(median)` fitted\n"
+        "on the training split only.\n"
+        "\n"
+        "`Cabin` (~77 % missing) is too sparse for direct use; `HasCabin` and\n"
+        "`Deck` extract the available signal.\n"
+    ),
 
-    md("## 7. Engineered features\n"
-       "\n"
-       "We reuse the *exact* feature-engineering function the training script uses, "
-       "so the EDA reflects what the model actually sees."),
-    code("feat = engineer_features(df)\n"
-         "feat['Survived'] = df[config.TARGET].values\n"
-         "feat.head()"),
-    code("# FamilySize / IsAlone and Title vs. survival.\n"
-         "fig, axes = plt.subplots(1, 3, figsize=(14, 4))\n"
-         "sns.barplot(data=feat, x='FamilySize', y='Survived', ax=axes[0], errorbar=None)\n"
-         "axes[0].set_title('Survival by family size')\n"
-         "sns.barplot(data=feat, x='IsAlone', y='Survived', ax=axes[1], errorbar=None)\n"
-         "axes[1].set_title('Survival: alone vs. not')\n"
-         "sns.barplot(data=feat, x='Title', y='Survived', ax=axes[2], errorbar=None)\n"
-         "axes[2].set_title('Survival by title'); axes[2].tick_params(axis='x', rotation=30)\n"
-         "plt.tight_layout(); plt.show()"),
-    md("Mid-size families fare better than singletons or very large families, and "
-       "`Title` (Mr/Mrs/Miss/Master/...) encodes sex + age + social status in one "
-       "feature - which is why we engineer it from `Name`."),
+    md("## 6. Survival by Sex, Pclass, and Embarked"),
+    code(
+        "cat_cols = ['Sex', 'Pclass', 'Embarked']\n"
+        "fig, axes = plt.subplots(1, 3, figsize=(14, 4))\n"
+        "for ax, col in zip(axes, cat_cols):\n"
+        "    r = train_df.groupby(col)['Survived'].mean().sort_values(ascending=False)\n"
+        "    sns.barplot(x=r.index.astype(str), y=r.values, ax=ax)\n"
+        "    ax.set_title(f'Survival rate by {col}')\n"
+        "    ax.set_ylabel('P(survived)'); ax.set_ylim(0, 1)\n"
+        "    for i, v in enumerate(r.values):\n"
+        "        ax.text(i, v+0.01, f'{v:.2f}', ha='center', fontsize=9)\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "- `Sex` is the strongest predictor (female ~74 % vs male ~19 %).\n"
+        "- `Pclass` shows a clear socioeconomic gradient (1st ~63 %, 3rd ~24 %).\n"
+        "- `Embarked` differences are partly confounded with Pclass/Sex.\n"
+    ),
 
-    md("## 8. Correlations (numeric view)"),
-    code("corr = feat.drop(columns=['Title', 'Deck', 'Sex', 'Embarked'], errors='ignore')\\\n"
-         "           .apply(pd.to_numeric, errors='coerce').corr()\n"
-         "plt.figure(figsize=(7, 6))\n"
-         "sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm', center=0)\n"
-         "plt.title('Correlation matrix (numeric & engineered)'); plt.show()"),
+    md("## 7. Sex x Pclass interaction"),
+    code(
+        "pivot = train_df.pivot_table(values='Survived', index='Sex',\n"
+        "                             columns='Pclass', aggfunc='mean')\n"
+        "fig, ax = plt.subplots(figsize=(6, 3))\n"
+        "sns.heatmap(pivot, annot=True, fmt='.2f', cmap='YlOrRd', vmin=0, vmax=1, ax=ax)\n"
+        "ax.set_title('Survival rate by Sex and Pclass')\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "Within each sex, Pclass matters substantially.  The embedding layers in\n"
+        "`TitanicEmbeddingMLP` learn these interactions implicitly.\n"
+    ),
 
-    md("## 9. EDA conclusions -> design choices\n"
-       "\n"
-       "- **Impute** `Age`/`Fare` with the median (skewed) and categoricals with the "
-       "mode; keep `Cabin` as a coarse `Deck` with an explicit `Unknown` level.\n"
-       "- **Scale** numeric features (the MLP needs standardised inputs).\n"
-       "- **One-hot encode** categoricals with `handle_unknown='ignore'` for robust "
-       "inference.\n"
-       "- **Engineer** `FamilySize`, `IsAlone`, `Title`, `Deck` - all row-wise and "
-       "therefore leakage-free.\n"
-       "- **Stratify** splits on `Survived` because the target is imbalanced.\n"
-       "- **Report** precision/recall/F1/ROC-AUC, not just accuracy.\n"
-       "- **Avoid leakage**: the preprocessor is fit on the training split only "
-       "(see `train.py`).\n"),
+    md("## 8. Age distribution"),
+    code(
+        "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n"
+        "train_df['Age'].dropna().plot.hist(bins=30, ax=axes[0], edgecolor='white')\n"
+        "axes[0].set_title('Age (all passengers)'); axes[0].set_xlabel('Age')\n"
+        "for surv, grp in train_df.groupby('Survived'):\n"
+        "    label = 'Survived' if surv == 1 else 'Did not survive'\n"
+        "    grp['Age'].dropna().plot.kde(ax=axes[1], label=label)\n"
+        "axes[1].set_title('Age KDE by survival'); axes[1].legend()\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print(f\"Mean age (survived):        {train_df[train_df.Survived==1].Age.mean():.1f}\")\n"
+        "print(f\"Mean age (did not survive): {train_df[train_df.Survived==0].Age.mean():.1f}\")\n"
+        "print(f\"Age missing:                {train_df.Age.isna().mean()*100:.1f}%\")\n"
+    ),
+
+    md("## 9. Fare distribution and log-transform motivation"),
+    code(
+        "fig, axes = plt.subplots(1, 3, figsize=(16, 4))\n"
+        "train_df['Fare'].dropna().plot.hist(bins=40, ax=axes[0], edgecolor='white')\n"
+        "axes[0].set_title('Fare (raw)'); axes[0].set_xlabel('Fare')\n"
+        "np.log1p(train_df['Fare'].fillna(0)).plot.hist(\n"
+        "    bins=40, ax=axes[1], edgecolor='white')\n"
+        "axes[1].set_title('log1p(Fare)'); axes[1].set_xlabel('log1p(Fare)')\n"
+        "for surv, grp in train_df.groupby('Survived'):\n"
+        "    np.log1p(grp['Fare'].fillna(0)).plot.kde(\n"
+        "        ax=axes[2], label='Survived' if surv==1 else 'Did not survive')\n"
+        "axes[2].set_title('log1p(Fare) KDE by survival'); axes[2].legend()\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print(f\"Fare skewness (raw):   {train_df.Fare.skew():.2f}\")\n"
+        "print(f\"Fare skewness (log1p): {np.log1p(train_df.Fare.fillna(0)).skew():.2f}\")\n"
+        "q3, q1 = train_df['Fare'].quantile(0.75), train_df['Fare'].quantile(0.25)\n"
+        "fence = q3 + 1.5*(q3-q1)\n"
+        "print(f\"High-fare outliers (> {fence:.1f}): {(train_df.Fare > fence).sum()}\")\n"
+    ),
+    md(
+        "Fare is **heavily right-skewed** (raw ~4.8; after `log1p` ~0.7).\n"
+        "`LogFare = log1p(Fare)` is the final pipeline feature.\n"
+    ),
+
+    md(
+        "## 10. Engineered features\n"
+        "\n"
+        "We apply the **exact same** `engineer_features()` from `src/preprocessing.py`\n"
+        "that `train.py` uses.  All transforms are row-wise — no leakage.\n"
+        "\n"
+        "**Final production feature set:**\n"
+        "\n"
+        "- Categorical (→ `nn.Embedding`): `Pclass`, `Sex`, `Embarked`, `Title`,\n"
+        "  `Deck`, `FamilySizeGroup`\n"
+        "- Continuous (→ imputed + scaled): `Age`, `LogFare`, `SibSp`, `Parch`,\n"
+        "  `FamilySize`, `IsAlone`, `HasCabin`, `AgeMissing`, `FareMissing`\n"
+    ),
+    code(
+        "from src.preprocessing import engineer_features\n"
+        "\n"
+        "feat = engineer_features(train_df.copy())\n"
+        "feat['Survived'] = train_df['Survived'].values\n"
+        "print('Engineered columns:', feat.columns.tolist())\n"
+        "feat.head()\n"
+    ),
+
+    md("### 10.1 Title"),
+    code(
+        "rates = (feat.groupby('Title')['Survived']\n"
+        "         .agg(['mean','count'])\n"
+        "         .rename(columns={'mean':'survival_rate','count':'n'})\n"
+        "         .sort_values('n', ascending=False))\n"
+        "display(rates.style.format({'survival_rate':'{:.2f}'}))\n"
+        "fig, ax = plt.subplots(figsize=(7, 3))\n"
+        "sns.barplot(x=rates.index, y='survival_rate', data=rates, ax=ax)\n"
+        "ax.set_title('Survival rate by Title')\n"
+        "ax.set_ylabel('P(survived)'); ax.set_ylim(0, 1)\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "`Title` encodes sex, age, and social status.  Rare honorifics are\n"
+        "collapsed to `Rare` to avoid vocabulary explosion in the embedding layer.\n"
+    ),
+
+    md("### 10.2 FamilySize, IsAlone, FamilySizeGroup"),
+    code(
+        "fig, axes = plt.subplots(1, 3, figsize=(15, 4))\n"
+        "fs = feat.groupby('FamilySize')['Survived'].mean()\n"
+        "sns.barplot(x=fs.index.astype(str), y=fs.values, ax=axes[0])\n"
+        "axes[0].set_title('Survival by FamilySize')\n"
+        "al = feat.groupby('IsAlone')['Survived'].mean()\n"
+        "sns.barplot(x=['Not alone','Alone'], y=al.values, ax=axes[1])\n"
+        "axes[1].set_title('Survival: alone vs not')\n"
+        "fg = feat.groupby('FamilySizeGroup')['Survived'].mean()\n"
+        "sns.barplot(x=fg.index.astype(str), y=fg.values, ax=axes[2])\n"
+        "axes[2].set_title('Survival by FamilySizeGroup')\n"
+        "for ax in axes: ax.set_ylabel('P(survived)'); ax.set_ylim(0, 1)\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "`FamilySizeGroup` uses **fixed bins** — no data-driven quantile fitting\n"
+        "before the split.\n"
+    ),
+
+    md("### 10.3 HasCabin and Deck"),
+    code(
+        "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n"
+        "hc = feat.groupby('HasCabin')['Survived'].mean()\n"
+        "sns.barplot(x=['No Cabin','Has Cabin'], y=hc.values, ax=axes[0])\n"
+        "axes[0].set_title('Survival by HasCabin')\n"
+        "dk = feat.groupby('Deck')['Survived'].mean().sort_values(ascending=False)\n"
+        "sns.barplot(x=dk.index.astype(str), y=dk.values, ax=axes[1])\n"
+        "axes[1].set_title('Survival by Deck')\n"
+        "for ax in axes: ax.set_ylabel('P(survived)'); ax.set_ylim(0, 1)\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print(f\"Proportion with known cabin: {feat['HasCabin'].mean()*100:.1f}%\")\n"
+    ),
+
+    md("### 10.4 Missing-value indicator features"),
+    code(
+        "for col in ['AgeMissing', 'FareMissing']:\n"
+        "    r = (feat.groupby(col)['Survived']\n"
+        "         .agg(['mean','count'])\n"
+        "         .rename(columns={'mean':'survival_rate','count':'n'}))\n"
+        "    r.index = r.index.map({0:'Not missing', 1:'Missing'})\n"
+        "    print(f'--- {col} ---')\n"
+        "    display(r.style.format({'survival_rate':'{:.2f}'})); print()\n"
+    ),
+
+    md(
+        "## 11. Train vs Kaggle test distribution comparison\n"
+        "\n"
+        "> **Reminder:** `data/raw/test.csv` has **no `Survived` labels** and\n"
+        "> is used here only for distribution checks — **never for evaluation**.\n"
+    ),
+    code(
+        "if test_df is None:\n"
+        "    print('data/raw/test.csv not available — skipping comparison.')\n"
+        "else:\n"
+        "    feat_test = engineer_features(test_df.copy())\n"
+        "    cat_check = ['Pclass', 'Sex', 'Embarked', 'Title', 'Deck', 'FamilySizeGroup']\n"
+        "    fig, axes = plt.subplots(2, 3, figsize=(16, 9))\n"
+        "    for ax, col in zip(axes.ravel(), cat_check):\n"
+        "        tr = feat[col].value_counts(normalize=True).rename('train')\n"
+        "        te = feat_test[col].value_counts(normalize=True).rename('test')\n"
+        "        pd.concat([tr, te], axis=1).fillna(0).plot.bar(ax=ax)\n"
+        "        ax.set_title(f'{col}'); ax.set_ylabel('Proportion')\n"
+        "        ax.tick_params(axis='x', rotation=30)\n"
+        "    plt.suptitle('Categorical: train vs test', y=1.01)\n"
+        "    plt.tight_layout(); plt.show()\n"
+    ),
+    code(
+        "if test_df is not None:\n"
+        "    num_check = ['Age', 'LogFare', 'FamilySize', 'HasCabin']\n"
+        "    fig, axes = plt.subplots(1, len(num_check), figsize=(16, 4))\n"
+        "    for ax, col in zip(axes, num_check):\n"
+        "        pd.to_numeric(feat[col], errors='coerce').dropna()\\\n"
+        "          .plot.kde(ax=ax, label='train')\n"
+        "        pd.to_numeric(feat_test[col], errors='coerce').dropna()\\\n"
+        "          .plot.kde(ax=ax, label='test')\n"
+        "        ax.set_title(col); ax.legend()\n"
+        "    plt.suptitle('Numeric: train vs test KDE', y=1.01)\n"
+        "    plt.tight_layout(); plt.show()\n"
+        "\n"
+        "    rows = []\n"
+        "    for col in num_check:\n"
+        "        tr = pd.to_numeric(feat[col], errors='coerce')\n"
+        "        te = pd.to_numeric(feat_test[col], errors='coerce')\n"
+        "        rows.append({'feature': col,\n"
+        "                     'train_mean': tr.mean(), 'test_mean': te.mean(),\n"
+        "                     'train_std':  tr.std(),  'test_std':  te.std(),\n"
+        "                     'train_miss%': tr.isna().mean()*100,\n"
+        "                     'test_miss%':  te.isna().mean()*100})\n"
+        "    display(pd.DataFrame(rows).set_index('feature').style.format('{:.3f}'))\n"
+    ),
+    md(
+        "Distributions are broadly similar.  The `TabularPreprocessor` handles\n"
+        "vocabulary differences via the OOV slot and imputes missing continuous\n"
+        "values using training-split medians.\n"
+    ),
+
+    md("## 12. Categorical feature associations (Cramer's V)"),
+    code(
+        "cat_feat_cols = ['Pclass', 'Sex', 'Embarked', 'Title',\n"
+        "                 'Deck', 'FamilySizeGroup', 'IsAlone',\n"
+        "                 'AgeMissing', 'FareMissing', 'HasCabin']\n"
+        "\n"
+        "def cramers_v(x, y):\n"
+        "    ct = pd.crosstab(x.astype(str), y.astype(str))\n"
+        "    chi2, _, _, _ = stats.chi2_contingency(ct)\n"
+        "    n = ct.sum().sum()\n"
+        "    r, k = ct.shape\n"
+        "    if min(r, k) <= 1: return 0.0\n"
+        "    return float(np.sqrt(chi2 / (n * (min(r, k) - 1))))\n"
+        "\n"
+        "all_cols = ['Survived'] + cat_feat_cols\n"
+        "mat = pd.DataFrame(\n"
+        "    [[cramers_v(feat[a].astype(str),\n"
+        "                feat['Survived'].astype(str) if b == 'Survived'\n"
+        "                else feat[b].astype(str))\n"
+        "      for b in all_cols]\n"
+        "     for a in cat_feat_cols],\n"
+        "    index=cat_feat_cols, columns=all_cols)\n"
+        "\n"
+        "fig, ax = plt.subplots(figsize=(11, 8))\n"
+        "sns.heatmap(mat, annot=True, fmt='.2f', cmap='Blues', vmin=0, vmax=1, ax=ax)\n"
+        "ax.set_title(\"Cramer's V association matrix\")\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print('Top associations with Survived:')\n"
+        "print(mat['Survived'].sort_values(ascending=False).to_string())\n"
+    ),
+
+    md(
+        "## 13. Mutual information feature ranking\n"
+        "\n"
+        "> **Note:** The MI ranking uses `pd.get_dummies` for **EDA ranking only**.\n"
+        "> The production `TitanicEmbeddingMLP` uses **custom vocabulary mappings\n"
+        "> + `nn.Embedding`**, not one-hot vectors.\n"
+    ),
+    code(
+        "CAT_FEATS  = ['Pclass', 'Sex', 'Embarked', 'Title', 'Deck', 'FamilySizeGroup']\n"
+        "CONT_FEATS = ['Age', 'LogFare', 'SibSp', 'Parch', 'FamilySize',\n"
+        "              'IsAlone', 'HasCabin', 'AgeMissing', 'FareMissing']\n"
+        "\n"
+        "feat_oh = pd.get_dummies(\n"
+        "    feat[CAT_FEATS + CONT_FEATS].copy(),\n"
+        "    columns=CAT_FEATS, drop_first=False)\n"
+        "feat_oh = feat_oh.apply(pd.to_numeric, errors='coerce').fillna(\n"
+        "    feat_oh.apply(pd.to_numeric, errors='coerce').median())\n"
+        "\n"
+        "mi_raw    = mutual_info_classif(feat_oh, feat['Survived'],\n"
+        "                                discrete_features='auto',\n"
+        "                                random_state=RANDOM_STATE)\n"
+        "mi_series = pd.Series(mi_raw, index=feat_oh.columns)\n"
+        "\n"
+        "mi_base = {}\n"
+        "for fname in CONT_FEATS:\n"
+        "    if fname in mi_series:\n"
+        "        mi_base[fname] = float(mi_series[fname])\n"
+        "for fname in CAT_FEATS:\n"
+        "    cols = [c for c in mi_series.index if c.startswith(fname + '_')]\n"
+        "    if cols:\n"
+        "        mi_base[fname] = float(mi_series[cols].max())\n"
+        "\n"
+        "mi_base_s = pd.Series(mi_base).sort_values(ascending=False)\n"
+        "fig, ax = plt.subplots(figsize=(8, 5))\n"
+        "mi_base_s.plot.barh(ax=ax); ax.invert_yaxis()\n"
+        "ax.set_xlabel('Mutual information with Survived')\n"
+        "ax.set_title('Feature importance (MI, EDA only)')\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print(mi_base_s.to_string())\n"
+    ),
+
+    md("## 14. Correlation with Survived (numeric and encoded features)"),
+    code(
+        "feat_enc = pd.get_dummies(\n"
+        "    feat[CAT_FEATS + CONT_FEATS].copy(),\n"
+        "    columns=CAT_FEATS, drop_first=False)\n"
+        "feat_enc = feat_enc.apply(pd.to_numeric, errors='coerce').fillna(\n"
+        "    feat_enc.apply(pd.to_numeric, errors='coerce').median())\n"
+        "feat_enc['Survived'] = feat['Survived'].values\n"
+        "\n"
+        "corr_surv = feat_enc.corr()['Survived'].drop('Survived').sort_values()\n"
+        "fig, ax = plt.subplots(figsize=(8, 10))\n"
+        "corr_surv.plot.barh(ax=ax)\n"
+        "ax.axvline(0, color='black', linewidth=0.8)\n"
+        "ax.set_title('Correlation with Survived (one-hot/numeric, EDA only)')\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print('Note: captures only linear effects.\\n'\n"
+        "      'Production model uses categorical embeddings for non-linear associations.')\n"
+    ),
+    code(
+        "num_corr_cols = ['Survived'] + CONT_FEATS\n"
+        "corr_num = (feat[num_corr_cols]\n"
+        "            .apply(pd.to_numeric, errors='coerce').corr())\n"
+        "fig, ax = plt.subplots(figsize=(9, 7))\n"
+        "sns.heatmap(corr_num, annot=True, fmt='.2f', cmap='coolwarm', center=0, ax=ax)\n"
+        "ax.set_title('Numeric feature correlation matrix')\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+
+    md(
+        "## 15. Features explored but excluded from the final production pipeline\n"
+        "\n"
+        "The following features were explored during EDA but are **not** in\n"
+        "`engineer_features()` or `train.py`.\n"
+    ),
+    code(
+        "# TicketGroupSize — count of passengers sharing the same Ticket\n"
+        "tgs = (train_df.groupby('Ticket')['PassengerId']\n"
+        "       .transform('count').rename('TicketGroupSize'))\n"
+        "tmp = train_df[['Survived']].copy(); tmp['TicketGroupSize'] = tgs\n"
+        "r = tmp.groupby('TicketGroupSize')['Survived'].agg(['mean','count'])\n"
+        "r.columns = ['survival_rate','n']\n"
+        "display(r.style.format({'survival_rate':'{:.2f}'}))\n"
+        "fig, ax = plt.subplots(figsize=(7, 3))\n"
+        "r['survival_rate'].plot.bar(ax=ax)\n"
+        "ax.set_title('Survival by TicketGroupSize (EDA only — NOT in production pipeline)')\n"
+        "ax.set_ylabel('P(survived)'); ax.set_ylim(0, 1)\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "**TicketGroupSize — excluded from the final pipeline** because it\n"
+        "requires a group-count aggregation that cannot be computed row-by-row\n"
+        "at inference time without a lookup table, which would complicate\n"
+        "`ds_app.py`.\n"
+    ),
+    code(
+        "# NameLength — character length of the Name field\n"
+        "tmp2 = train_df[['Survived','Name']].copy()\n"
+        "tmp2['NameLength'] = tmp2['Name'].str.len()\n"
+        "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n"
+        "for surv, grp in tmp2.groupby('Survived'):\n"
+        "    grp['NameLength'].plot.kde(\n"
+        "        ax=axes[0], label='Survived' if surv==1 else 'Did not survive')\n"
+        "axes[0].legend()\n"
+        "axes[0].set_title('NameLength KDE (EDA only — NOT in production pipeline)')\n"
+        "axes[1].scatter(tmp2['NameLength'], tmp2['Survived'], alpha=0.1)\n"
+        "axes[1].set_title('Survived vs NameLength')\n"
+        "axes[1].set_xlabel('NameLength'); axes[1].set_ylabel('Survived')\n"
+        "plt.tight_layout(); plt.show()\n"
+        "print(f\"Correlation(NameLength, Survived): \"\n"
+        "      f\"{tmp2['NameLength'].corr(tmp2['Survived']):.3f}\")\n"
+    ),
+    md(
+        "**NameLength — excluded from the final pipeline** because its signal is\n"
+        "already captured more cleanly by `Title` and `Pclass`.\n"
+    ),
+    code(
+        "# AgeBin and FareBin — discretised Age and LogFare\n"
+        "tmp3 = feat[['Survived','Age','LogFare']].copy()\n"
+        "tmp3['AgeBin']  = pd.cut(tmp3['Age'].fillna(tmp3['Age'].median()),\n"
+        "                         bins=[0,12,18,35,60,100],\n"
+        "                         labels=['Child','Teen','Adult','Middle','Senior'])\n"
+        "tmp3['FareBin'] = pd.cut(tmp3['LogFare'].fillna(0), bins=5,\n"
+        "                         labels=['V.Low','Low','Med','High','V.High'])\n"
+        "fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n"
+        "r_age  = tmp3.groupby('AgeBin',  observed=True)['Survived'].mean()\n"
+        "r_fare = tmp3.groupby('FareBin', observed=True)['Survived'].mean()\n"
+        "sns.barplot(x=r_age.index.astype(str),  y=r_age.values,  ax=axes[0])\n"
+        "axes[0].set_title('Survival by AgeBin (EDA only — NOT in production pipeline)')\n"
+        "axes[0].set_ylabel('P(survived)'); axes[0].set_ylim(0, 1)\n"
+        "sns.barplot(x=r_fare.index.astype(str), y=r_fare.values, ax=axes[1])\n"
+        "axes[1].set_title('Survival by FareBin (EDA only — NOT in production pipeline)')\n"
+        "axes[1].set_ylabel('P(survived)'); axes[1].set_ylim(0, 1)\n"
+        "plt.tight_layout(); plt.show()\n"
+    ),
+    md(
+        "**AgeBin / FareBin — excluded from the final pipeline** because the model\n"
+        "uses continuous `Age` and `LogFare` directly, data-driven bin edges\n"
+        "require pre-split fitting (leakage), and neural networks can learn\n"
+        "non-linear patterns from continuous values without explicit binning.\n"
+    ),
+
+    md(
+        "## 16. Leakage prevention and evaluation strategy\n"
+        "\n"
+        "### Row-wise features — safe before the split\n"
+        "\n"
+        "Every feature in `engineer_features()` is computed from a single row;\n"
+        "no dataset-level statistics are computed before the split.\n"
+        "\n"
+        "| Feature | Derivation |\n"
+        "|---|---|\n"
+        "| `Title` | Regex on `Name` |\n"
+        "| `FamilySize` | `SibSp + Parch + 1` |\n"
+        "| `IsAlone` | `FamilySize == 1` |\n"
+        "| `FamilySizeGroup` | **Fixed** bins [0,1], [2,4], [5+] |\n"
+        "| `HasCabin` | Whether Cabin is non-null/non-empty |\n"
+        "| `Deck` | First letter of `Cabin` |\n"
+        "| `LogFare` | `log1p(Fare)` — no statistics |\n"
+        "| `AgeMissing` | `Age.isna()` before imputation |\n"
+        "| `FareMissing` | `Fare.isna()` before imputation |\n"
+        "\n"
+        "### Fitted on the training split only\n"
+        "\n"
+        "| Preprocessor | Fitted on | Applied to |\n"
+        "|---|---|---|\n"
+        "| `TabularPreprocessor` vocabulary | Train split | Val, test, inference |\n"
+        "| `SimpleImputer(median)` | Train split | Val, test, inference |\n"
+        "| `StandardScaler` | Train split | Val, test, inference |\n"
+        "| Baseline `OneHotEncoder` | Train split | Val, test, inference |\n"
+        "\n"
+        "### Evaluation\n"
+        "\n"
+        "- `data/raw/test.csv` has **no `Survived` labels** and is **never used\n"
+        "  for evaluation**.\n"
+        "- `data/raw/gender_submission.csv` must **not** be treated as ground truth.\n"
+        "- All evaluation uses a **stratified 70/15/15 hold-out split of\n"
+        "  `data/raw/train.csv`**.  The test split is evaluated exactly once.\n"
+    ),
+
+    md(
+        "## 17. Conclusions and pipeline decisions\n"
+        "\n"
+        "### Preprocessing (production)\n"
+        "\n"
+        "| Decision | Justification |\n"
+        "|---|---|\n"
+        "| `LogFare` instead of raw `Fare` | Skewness 4.8 → 0.7; reduces outlier influence |\n"
+        "| `AgeMissing` indicator | Missingness appears informative; binary row-wise |\n"
+        "| `FareMissing` indicator | 1 row missing in test.csv |\n"
+        "| Median imputation | Robust; fitted on training split only |\n"
+        "| `Deck = Unknown` for missing Cabin | 77 % missing; `HasCabin`+`Deck` encode signal |\n"
+        "| Fixed bins for `FamilySizeGroup` | No quantile fitting before the split |\n"
+        "| Title normalised to 5 groups | Rare titles lack data for stable embeddings |\n"
+        "| `StandardScaler` | MLP gradients benefit from zero-mean/unit-variance |\n"
+        "\n"
+        "### Modelling\n"
+        "\n"
+        "| Decision | Justification |\n"
+        "|---|---|\n"
+        "| **Final model: `TitanicEmbeddingMLP`** (PyTorch) | Categorical embeddings; more expressive than one-hot |\n"
+        "| `LayerNorm` instead of `BatchNorm` | Works with any batch size including batch=1 at inference |\n"
+        "| `BCEWithLogitsLoss` | Numerically stable binary cross-entropy |\n"
+        "| Early stopping on val loss | Prevents overfitting on ~620 training rows |\n"
+        "| Threshold tuned on validation split | Maximises F1; applied to test set once |\n"
+        "| Classical baselines (LR/RF/GB) | **Comparison only — never used for inference** |\n"
+        "| Streamlit app `ds_app.py` | Uses `TitanicEmbeddingMLP` for inference |\n"
+    ),
 ]
 
 
@@ -156,7 +665,11 @@ def main() -> None:
     nb = {
         "cells": CELLS,
         "metadata": {
-            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
             "language_info": {"name": "python", "version": "3.x"},
         },
         "nbformat": 4,
